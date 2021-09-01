@@ -1,0 +1,5 @@
+aws_nsc_new_s3_lifecycle_automation.yml
+    1. Before deployment, user must enable/create a trail through AWS CloudTrail. The event that is configured is an "AWS API Call via CloudTrail". Because of this
+       we must enabled a trail so CloudWatch event can track the "CreateBucket" API call. Please refer to the "rCreateBucketEvent" for more details.
+    2. Deploy CloudFormation Template in Console or CLI.
+    3. As a result of Deployment, whenever a S3 bucket is created at the time of creation with no Lifecycle rule, a default lifecycle rule will be applied to the given S3 bucket.

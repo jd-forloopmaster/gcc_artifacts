@@ -1,0 +1,243 @@
+#Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#Permission is hereby granted, free of charge, to any person obtaining a copy of this
+#software and associated documentation files (the "Software"), to deal in the Software
+#without restriction, including without limitation the rights to use, copy, modify,
+#merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+#permit persons to whom the Software is furnished to do so.
+#THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+#INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+#PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+#HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+#OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+#SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+# https://aws.amazon.com/agreement
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: SIM ID RCS-1827
+
+             This Cloudformation template automates the process of applying an establish lifecycle rule for S3 buckets that did not have a lifecycle rule set at the time of creation. After 90 days objects will be moved to Glacier and after 90 days objects will be moved to Deep Glaicer.
+             Prerequisite - You must use set up/enable Trail in CloudTrail to log the AWS API Call using CloudWatch Events
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - 
+        Label: 
+          default: "General Configuartions"
+        Parameters: 
+          - pEmail
+          - pAccountName
+
+    ParameterLabels: 
+      pEmail:
+        default:  "Please enter the email address that will recieve alerts for the S3 lifecycle automation"
+
+      pAccountName:
+        default:  "Please enter the AWS Account Name"
+
+Parameters:
+  pEmail:
+    Description: 'Enter the email address to get alerted'
+    Type: String
+    Default: "____@amazon.com"
+
+  pAccountName:
+    Description: 'Friendly AWS Account Name'
+    Type: String
+    Default: "Sandbox"
+    AllowedPattern: ^[a-zA-Z0-9]*$  
+      
+Resources:
+  rCreateBucketEvent:  
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "S3 Create Bucket Event Rule"
+      Name: !Sub '${AWS::StackName}-CreateS3BucketEvent'
+      EventPattern: 
+        source:
+          - "aws.s3"
+        detail-type: 
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - "CreateBucket"
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: !GetAtt rS3LifecycleLambda.Arn
+          Id: "rS3LifecycleLambda"
+
+  rLambdaIamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: "S3AutomationLambdaRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaServiceToAssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+        - arn:aws:iam::aws:policy/AWSCloudTrail_FullAccess
+
+  rEmailTopic: 
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+      - Endpoint: !Ref pEmail
+        Protocol: email
+      TopicName: !Sub '${AWS::StackName}-topic'
+
+  rTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id: ConfigTopicPolicy
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: config.amazonaws.com
+          Action: SNS:Publish
+          Resource: '*'
+      Topics: 
+      - !Ref 'rEmailTopic'
+
+  rS3LifecycleLambda: 
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-lambda'
+      Runtime: python3.8
+      Timeout: 240
+      MemorySize: 2048
+      Role: !GetAtt 'rLambdaIamRole.Arn'
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import logging
+          import boto3
+          from botocore.exceptions import ClientError
+
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          snsarn = "${rEmailTopic}"
+
+          default_lifecycle_config_settings = {
+              'Rules': [
+                  {'ID': 'Default 1 Year Lifecycle Rule',
+                  'Filter': {'Prefix': ''},
+                  'Status': 'Enabled',
+                  'Transitions': [
+                              {
+                                  'Days': 90,
+                                  'StorageClass': 'GLACIER'
+                              
+                              },
+                              {
+                                  'Days': 180,
+                                  'StorageClass': 'DEEP_ARCHIVE'
+                                  
+                              },
+                          ],
+                  'Expiration': {'Days': 395 },
+                  'NoncurrentVersionExpiration': {'NoncurrentDays': 30},
+                  'AbortIncompleteMultipartUpload': {'DaysAfterInitiation': 7},
+                  }
+              ]
+          }
+
+          def put_bucket_lifecycle_configuration(bucket_name, lifecycle_config):
+              """Set the lifecycle configuration of an Amazon S3 bucket
+
+              :param bucket_name: string
+              :param lifecycle_config: dict of lifecycle configuration settings
+              :return: True if lifecycle configuration was set, otherwise False
+              """
+              try:
+                  s3.put_bucket_lifecycle_configuration(Bucket = bucket_name, LifecycleConfiguration = lifecycle_config)
+              except ClientError as e:
+                  return False
+              return True
+
+          def get_bucket_lifecycle_of_s3(bucket_name):
+              try:
+                  s3.get_bucket_lifecycle_configuration(Bucket = bucket_name)
+              except ClientError as e:
+                return False
+              return True
+
+          def lambda_handler(event, context):
+              test_bucket_name = event.get('detail').get('requestParameters').get('bucketName')
+              result = get_bucket_lifecycle_of_s3(test_bucket_name)
+              
+              if result == False:
+                  success = put_bucket_lifecycle_configuration(test_bucket_name, default_lifecycle_config_settings)
+                  print(f"Successfuly set the default lifecycle rule on S3: {test_bucket_name}")
+                  
+              msg = f""" The S3 Bucket: {test_bucket_name} did not have a lifeycle rule when created. 
+
+          We have included the following the default (1 year) lifecyle rule for the S3 bucket.
+
+          Current Version Actions:
+              ◦ Day 0 Objects Uploaded
+              ◦ Day 90 (3 Months) Objects transition to Glacier
+              ◦ Day 180 (6 Months) Objects transition to Glacier Deep Archive
+              ◦ Day 395 (1 Year and 1 month) Objects expire
+
+          Previous Version Actions:
+              ◦ Day 0 Objects become noncurrent
+              ◦ Day 30 Objects are permanently deleted
+              """
+              subjectemail = f"S3 Bucket:{test_bucket_name} deployed in ${pAccountName} did not have a Lifecycle rule."
+              snsresponse = sns.publish(TopicArn = snsarn, 
+                                        Message = msg, 
+                                        Subject = subjectemail)
+      Description: Automates a established 1 year lifecycle rule for newly created S3 buckets that did not have lifcycle(s) rules set at the time of creation
+      Environment:
+        Variables:
+          vAccountName: !Ref pAccountName
+      TracingConfig:
+        Mode: Active
+
+  rS3LambdaInvokePermissions: 
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref rS3LifecycleLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt rCreateBucketEvent.Arn  
+
+Outputs:
+
+  oLambdaIamRole:
+    Description: Lambda IAM Role
+    Value: !Ref rLambdaIamRole
+    Export:
+      Name: !Sub '${AWS::StackName}-rLambdaIamRole'
+
+  oS3LifecycleLambda:
+    Description: Lambda function for automatating lifecycle rules
+    Value: !Ref rS3LifecycleLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-rS3LifecycleLambda'
+
+  oS3LifecycleLambdaArn:
+    Description: Arn lambda function for automatating lifecycle rules
+    Value: !GetAtt rS3LifecycleLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-rS3LifecycleLambdaArn'
+
+  oCreateBucketEvent:
+    Description: S3 CreateBucket Event
+    Value: !Ref rCreateBucketEvent
+    Export:
+      Name: !Sub '${AWS::StackName}-rCreateBucketEvent'
